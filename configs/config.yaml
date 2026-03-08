@@ -1,0 +1,49 @@
+# ============================================================
+# Loop Closure Detection — Master Configuration
+# ============================================================
+
+# --- Paths ---
+paths:
+  dataset_root: "dataset"
+  processed_root: "processed"
+  lidar_subdir: "lidar/pointclouds"
+  camera_subdir: "camera/images"
+  odometry_csv: "odometry/novatel_odom.csv"
+  gps_csv: "gps/inspva_precision.csv"
+
+# --- Step 1A: Sync & Projection ---
+sync:
+  max_sync_error_ms: 50.0       # discard pairs with sync error above this
+
+projection:
+  num_beams: 128                 # Ouster OS1-128
+  num_columns: 1024              # azimuth resolution
+  max_range: 100.0               # clip ranges above this (meters)
+  fields_per_point: 5            # x, y, z, intensity, ring
+
+# --- Step 1C: Triplet Mining ---
+mining:
+  d_pos_m: 5.0                  # max distance (m) for "same place"
+  d_neg_m: 25.0                 # min distance (m) for "different place"
+  d_time_s: 60.0                # min temporal gap (s) for positive pairs
+
+# --- Step 2B: Model ---
+model:
+  embedding_dim: 256
+  camera_input_size: [224, 224]  # resize camera images to this
+
+# --- Step 3: Training ---
+training:
+  batch_size: 32
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  num_epochs: 50
+  triplet_margin: 0.2
+  early_stopping_patience: 7
+  modality_dropout_prob: 0.15    # prob of zeroing out one sensor
+
+# --- Train / Val / Test split (by time) ---
+split:
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
