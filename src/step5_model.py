@@ -122,11 +122,15 @@ class TwoStreamEncoder(nn.Module):
 
         if self.training and self.modality_dropout_prob > 0:
             B = l_feat.size(0)
+            p = self.modality_dropout_prob
             r = torch.rand(B, 1, device=l_feat.device)
-            l_mask = (r >= self.modality_dropout_prob).float()
-            c_mask = ((r < self.modality_dropout_prob) | (r >= 2 * self.modality_dropout_prob)).float()
-            l_feat = l_feat * l_mask
-            c_feat = c_feat * c_mask
+            drop_lidar = (r < p).float()
+            drop_camera = ((r >= p) & (r < 2 * p)).float()
+            # Scale surviving modality by 2x to compensate for zeroed-out partner
+            l_scale = (1 - drop_lidar) * (1 + drop_camera)
+            c_scale = (1 - drop_camera) * (1 + drop_lidar)
+            l_feat = l_feat * l_scale
+            c_feat = c_feat * c_scale
 
         if mode == "lidar_only":
             c_feat = torch.zeros_like(c_feat)

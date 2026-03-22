@@ -70,16 +70,19 @@ def train_one_epoch(
         if scaler is not None:
             scaler.scale(loss).backward()
             if (i + 1) % accumulate_grad_batches == 0 or (i + 1) == len(loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
             if (i + 1) % accumulate_grad_batches == 0 or (i + 1) == len(loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-        running_loss += loss.item()
+        running_loss += loss.item() * accumulate_grad_batches  # undo scaling for logging
         n_batches += 1
 
     avg_loss = running_loss / max(n_batches, 1)
@@ -171,12 +174,15 @@ def train_one_epoch_hard(
         if scaler is not None:
             scaler.scale(loss).backward()
             if (i + 1) % accumulate_grad_batches == 0 or (i + 1) == len(loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
             if (i + 1) % accumulate_grad_batches == 0 or (i + 1) == len(loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -298,6 +304,8 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
     scheduler = ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=3,
     )
+    warmup_epochs = 3
+    base_lr = train_cfg["learning_rate"]
 
     # ── Resume from checkpoint ────────────────────────────────────────────
     start_epoch = 0
@@ -377,8 +385,14 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
             # Validate
             val_metrics = validate(model, val_loader, criterion, device)
 
-            # LR scheduler
-            scheduler.step(val_metrics["loss"])
+            # LR scheduler: warmup for first N epochs, then ReduceLROnPlateau
+            if global_epoch < warmup_epochs:
+                # Linear warmup: start at 0.1*base_lr, ramp to base_lr
+                warmup_factor = 0.1 + 0.9 * (global_epoch + 1) / warmup_epochs
+                for pg in optimizer.param_groups:
+                    pg["lr"] = base_lr * warmup_factor
+            else:
+                scheduler.step(val_metrics["loss"])
             current_lr = optimizer.param_groups[0]["lr"]
 
             elapsed = time.time() - t0

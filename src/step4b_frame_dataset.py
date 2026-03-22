@@ -94,6 +94,8 @@ class PKSampler(Sampler):
         self.n_batches = max(len(self.place_ids) // P, 1) * epochs_worth
 
     def __iter__(self):
+        # Re-seed each epoch so batches vary across epochs
+        self.rng = np.random.RandomState(self.rng.randint(2**31))
         for _ in range(self.n_batches):
             # Sample P places without replacement (if enough places)
             if len(self.place_ids) >= self.P:
