@@ -28,15 +28,15 @@ def mine_triplets(
     d_pos: float,
     d_neg: float,
     d_time: float,
-    max_positives_per_anchor: int = 5,
+    max_positives_per_anchor: int = 10,
     seed: int = 42,
 ) -> pd.DataFrame:
     """
     Mine triplets from frame poses.
 
     For each anchor, find positive candidates (close in space, far in time)
-    and negative candidates (far in space). Sample up to
-    max_positives_per_anchor triplets per anchor.
+    and semi-hard negative candidates (far in space, but not trivially far).
+    Sample up to max_positives_per_anchor triplets per anchor.
     """
     rng = random.Random(seed)
     N = len(poses_xy)
@@ -48,8 +48,11 @@ def mine_triplets(
     print(f"  Querying positive candidates (d < {d_pos}m, dt > {d_time}s)...")
     pos_neighbors = tree.query_ball_tree(tree, r=d_pos)
 
-    # Pre-compute negative candidates: frames farther than d_neg
-    # For efficiency, we sample negatives on-the-fly per anchor
+    # Pre-compute semi-hard negative candidates (between d_neg and 3*d_neg)
+    d_neg_hard = 3 * d_neg
+    print(f"  Querying semi-hard negative candidates ({d_neg}m < d < {d_neg_hard}m)...")
+    semihard_neighbors = tree.query_ball_tree(tree, r=d_neg_hard)
+
     print(f"  Mining triplets...")
     triplets = []
 
@@ -66,15 +69,26 @@ def mine_triplets(
         if len(positives) > max_positives_per_anchor:
             positives = rng.sample(positives, max_positives_per_anchor)
 
+        # Pre-compute semi-hard negatives for this anchor
+        # These are frames between d_neg and d_neg_hard away
+        semihard_negs = [
+            j for j in semihard_neighbors[anchor]
+            if np.linalg.norm(poses_xy[anchor] - poses_xy[j]) > d_neg
+        ]
+
         for pos in positives:
-            # Find a hard-ish negative: random frame that is far away
-            # Try up to 10 times to find one
-            for _ in range(10):
-                neg = rng.randint(0, N - 1)
-                dist = np.linalg.norm(poses_xy[anchor] - poses_xy[neg])
-                if dist > d_neg:
-                    triplets.append((anchor, pos, neg))
-                    break
+            # Prefer semi-hard negatives (challenging but valid)
+            if semihard_negs:
+                neg = rng.choice(semihard_negs)
+                triplets.append((anchor, pos, neg))
+            else:
+                # Fallback: random frame that is far away
+                for _ in range(15):
+                    neg = rng.randint(0, N - 1)
+                    dist = np.linalg.norm(poses_xy[anchor] - poses_xy[neg])
+                    if dist > d_neg:
+                        triplets.append((anchor, pos, neg))
+                        break
 
     df = pd.DataFrame(triplets, columns=["anchor_idx", "positive_idx", "negative_idx"])
     return df

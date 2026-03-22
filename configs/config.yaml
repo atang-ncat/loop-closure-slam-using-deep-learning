@@ -24,7 +24,7 @@ projection:
 # --- Step 1C: Triplet Mining ---
 mining:
   d_pos_m: 5.0                  # max distance (m) for "same place"
-  d_neg_m: 25.0                 # min distance (m) for "different place"
+  d_neg_m: 10.0                 # min distance (m) for "different place" (confusable zone starts here)
   d_time_s: 60.0                # min temporal gap (s) for positive pairs
 
 # --- Step 2B: Model ---
@@ -38,7 +38,7 @@ training:
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
   num_epochs: 50
-  triplet_margin: 1.0             # increased from 0.2 for hard negatives
+  triplet_margin: 1.0             # margin for triplet loss
   early_stopping_patience: 10
   modality_dropout_prob: 0.15     # prob of zeroing out one sensor
   accumulate_grad_batches: 2
