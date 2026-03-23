@@ -183,7 +183,12 @@ def run(cfg: dict, checkpoint_path: str) -> None:
     max_range = cfg["projection"]["max_range"]
 
     # ── Load model ────────────────────────────────────────────────────────
-    model = SiameseNetwork(embedding_dim=model_cfg["embedding_dim"], pretrained=False)
+    model = SiameseNetwork(
+        embedding_dim=model_cfg["embedding_dim"],
+        backbone=model_cfg.get("backbone", "resnet50"),
+        pretrained=False,
+        gem_p=model_cfg.get("gem_p", 3.0),
+    )
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     model = model.to(device)

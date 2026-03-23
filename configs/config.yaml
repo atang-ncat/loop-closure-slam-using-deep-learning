@@ -24,29 +24,32 @@ projection:
 # --- Step 1C: Triplet Mining ---
 mining:
   d_pos_m: 5.0                  # max distance (m) for "same place"
-  d_neg_m: 10.0                 # min distance (m) for "different place" (confusable zone starts here)
+  d_neg_m: 10.0                 # min distance (m) for "different place"
   d_time_s: 60.0                # min temporal gap (s) for positive pairs
 
 # --- Step 2B: Model ---
 model:
-  embedding_dim: 256
+  embedding_dim: 512
+  backbone: resnet50             # resnet18 or resnet50
+  gem_p: 3.0                     # GeM pooling initial power
   camera_input_size: [224, 224]  # resize camera images to this
 
 # --- Step 3: Training ---
 training:
-  batch_size: 24
+  loss: multi_similarity         # triplet or multi_similarity
+  batch_size: 12                 # reduced for ResNet-50 memory
   learning_rate: 1.0e-4
-  weight_decay: 1.0e-5
+  weight_decay: 1.0e-4           # stronger regularization for larger model
   num_epochs: 50
-  triplet_margin: 1.0             # margin for triplet loss
-  early_stopping_patience: 10
-  modality_dropout_prob: 0.15     # prob of zeroing out one sensor
-  accumulate_grad_batches: 2
+  triplet_margin: 1.0            # used for validation metric
+  early_stopping_patience: 15    # more patience with cosine annealing
+  modality_dropout_prob: 0.15
+  accumulate_grad_batches: 4     # effective batch = 48
   amp: true
-  hard_mining: true               # use online batch-hard mining
-  hard_mining_epochs: 20           # phase 2 fine-tuning epochs
-  P: 8                            # places per batch
-  K: 4                            # frames per place
+  # Multi-Similarity Loss params
+  ms_alpha: 2.0
+  ms_beta: 50.0
+  ms_base: 0.5
 
 # --- Train / Val / Test split (by time) ---
 split:

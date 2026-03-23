@@ -1,8 +1,8 @@
 """
-Step 3 — Training Loop with Triplet Margin Loss
-=================================================
+Step 3 — Training Loop with Multi-Similarity Loss
+===================================================
 Trains the Two-Stream Siamese CNN to produce location fingerprints
-using metric learning.
+using metric learning with Multi-Similarity Loss.
 
 Usage:
     python -m src.step6_train
@@ -18,11 +18,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from tqdm import tqdm
 
 from src.step4_dataset import build_dataloaders
-from src.step4b_frame_dataset import build_hard_dataloaders
 from src.step5_model import SiameseNetwork
 
 
@@ -40,32 +39,142 @@ def count_parameters(model: nn.Module) -> tuple[int, int]:
     return total, trainable
 
 
+# ── Multi-Similarity Loss ────────────────────────────────────────────────────
+
+class MultiSimilarityLoss(nn.Module):
+    """
+    Multi-Similarity Loss (Wang et al., CVPR 2019).
+
+    Considers ALL positive and negative pairs in a batch, weighting them
+    by their similarity. Much stronger gradient signal than triplet loss.
+    """
+
+    def __init__(self, alpha: float = 2.0, beta: float = 50.0, base: float = 0.5, margin: float = 0.1):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.base = base
+        self.margin = margin
+
+    def forward(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        embeddings: (B, D) L2-normalized
+        labels: (B,) integer place labels
+        """
+        # Cosine similarity matrix (since embeddings are L2-normalized)
+        sim_mat = embeddings @ embeddings.T  # (B, B)
+
+        B = embeddings.size(0)
+        labels = labels.unsqueeze(0)
+        same = (labels == labels.T)
+        eye = torch.eye(B, dtype=torch.bool, device=embeddings.device)
+        pos_mask = same & ~eye
+        neg_mask = ~same
+
+        loss = torch.tensor(0.0, device=embeddings.device)
+        n_valid = 0
+
+        for i in range(B):
+            pos_idx = pos_mask[i].nonzero(as_tuple=True)[0]
+            neg_idx = neg_mask[i].nonzero(as_tuple=True)[0]
+
+            if len(pos_idx) == 0 or len(neg_idx) == 0:
+                continue
+
+            pos_sim = sim_mat[i, pos_idx]
+            neg_sim = sim_mat[i, neg_idx]
+
+            # Mining: keep hard positives and hard negatives
+            neg_max = neg_sim.max()
+            pos_min = pos_sim.min()
+
+            # Keep negatives harder than easiest positive
+            hard_neg = neg_sim[neg_sim + self.margin > pos_min]
+            # Keep positives harder than easiest negative
+            hard_pos = pos_sim[pos_sim - self.margin < neg_max]
+
+            if len(hard_neg) == 0 or len(hard_pos) == 0:
+                continue
+
+            # Positive term: pull together
+            pos_loss = (1.0 / self.alpha) * torch.log(
+                1 + torch.sum(torch.exp(-self.alpha * (hard_pos - self.base)))
+            )
+            # Negative term: push apart
+            neg_loss = (1.0 / self.beta) * torch.log(
+                1 + torch.sum(torch.exp(self.beta * (hard_neg - self.base)))
+            )
+
+            loss = loss + pos_loss + neg_loss
+            n_valid += 1
+
+        return loss / max(n_valid, 1)
+
+
 # ── Training / Validation steps ───────────────────────────────────────────────
 
 def train_one_epoch(
     model: SiameseNetwork,
     loader,
-    criterion: nn.TripletMarginLoss,
+    criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scaler: torch.cuda.amp.GradScaler | None,
+    scaler,
     accumulate_grad_batches: int,
+    loss_type: str = "triplet",
 ) -> dict:
     model.train()
     running_loss = 0.0
     n_batches = 0
+    last_d_pos = 0.0
+    last_d_neg = 0.0
 
-    for i, ((a_li, a_cam), (p_li, p_cam), (n_li, n_cam)) in enumerate(tqdm(loader, desc="  Train", leave=False)):
-        a_li, a_cam = a_li.to(device), a_cam.to(device)
-        p_li, p_cam = p_li.to(device), p_cam.to(device)
-        n_li, n_cam = n_li.to(device), n_cam.to(device)
+    for i, batch in enumerate(tqdm(loader, desc="  Train", leave=False)):
+        if loss_type == "multi_similarity":
+            # Unpack triplet batch and create a combined batch with labels
+            (a_li, a_cam), (p_li, p_cam), (n_li, n_cam) = batch
+            # Stack anchor + positive as "same place" (label 0..B-1)
+            # and negative as "different place" (label B..2B-1)
+            B = a_li.size(0)
 
-        with torch.autocast(device_type=device.type, enabled=scaler is not None):
-            desc_a, desc_p, desc_n = model(
-                (a_li, a_cam), (p_li, p_cam), (n_li, n_cam),
-            )
-            loss = criterion(desc_a, desc_p, desc_n)
-            loss = loss / accumulate_grad_batches
+            all_lidar = torch.cat([a_li, p_li, n_li], dim=0).to(device)
+            all_camera = torch.cat([a_cam, p_cam, n_cam], dim=0).to(device)
+            # Labels: anchor_i and positive_i share label i, negative_i gets label B+i
+            labels = torch.cat([
+                torch.arange(B),
+                torch.arange(B),        # positive shares label with anchor
+                torch.arange(B, 2 * B), # negative gets unique label
+            ]).to(device)
+
+            with torch.autocast(device_type=device.type, enabled=scaler is not None):
+                embeddings = model.encoder(all_lidar, all_camera)
+                loss = criterion(embeddings, labels)
+                loss = loss / accumulate_grad_batches
+
+            # Compute metrics from the embeddings
+            with torch.no_grad():
+                desc_a = embeddings[:B]
+                desc_p = embeddings[B:2*B]
+                desc_n = embeddings[2*B:]
+                last_d_pos = (desc_a - desc_p).pow(2).sum(dim=1).sqrt().mean().item()
+                last_d_neg = (desc_a - desc_n).pow(2).sum(dim=1).sqrt().mean().item()
+        else:
+            # Standard triplet loss
+            (a_li, a_cam), (p_li, p_cam), (n_li, n_cam) = batch
+            a_li, a_cam = a_li.to(device), a_cam.to(device)
+            p_li, p_cam = p_li.to(device), p_cam.to(device)
+            n_li, n_cam = n_li.to(device), n_cam.to(device)
+
+            with torch.autocast(device_type=device.type, enabled=scaler is not None):
+                desc_a, desc_p, desc_n = model(
+                    (a_li, a_cam), (p_li, p_cam), (n_li, n_cam),
+                )
+                loss = criterion(desc_a, desc_p, desc_n)
+                loss = loss / accumulate_grad_batches
+
+            with torch.no_grad():
+                last_d_pos = (desc_a - desc_p).pow(2).sum(dim=1).sqrt().mean().item()
+                last_d_neg = (desc_a - desc_n).pow(2).sum(dim=1).sqrt().mean().item()
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -82,125 +191,21 @@ def train_one_epoch(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-        running_loss += loss.item() * accumulate_grad_batches  # undo scaling for logging
+        running_loss += loss.item() * accumulate_grad_batches
         n_batches += 1
 
     avg_loss = running_loss / max(n_batches, 1)
-
-    # Compute some embedding quality metrics on the last batch
-    with torch.no_grad():
-        d_pos = (desc_a - desc_p).pow(2).sum(dim=1).sqrt().mean().item()
-        d_neg = (desc_a - desc_n).pow(2).sum(dim=1).sqrt().mean().item()
-
-    return {"loss": avg_loss, "d_pos": d_pos, "d_neg": d_neg}
-
-
-def batch_hard_triplet_loss(
-    embeddings: torch.Tensor,
-    labels: torch.Tensor,
-    margin: float,
-) -> tuple[torch.Tensor, float, float]:
-    """
-    Batch-hard triplet loss.
-
-    For each anchor, find:
-      - the hardest positive (same label, max distance)
-      - the hardest negative (different label, min distance)
-
-    Returns (loss, mean_d_pos, mean_d_neg).
-    """
-    # Pairwise distance matrix
-    dist_mat = torch.cdist(embeddings, embeddings, p=2)  # (B, B)
-
-    B = embeddings.size(0)
-    labels = labels.unsqueeze(0)  # (1, B)
-    same_place = (labels == labels.T)  # (B, B)
-    diff_place = ~same_place
-
-    # Mask out self-comparisons
-    eye = torch.eye(B, dtype=torch.bool, device=embeddings.device)
-    same_place = same_place & ~eye
-
-    # Hardest positive: max dist among same-place pairs
-    # Set non-positive pairs to -1 so they won't be selected as max
-    pos_dists = dist_mat.clone()
-    pos_dists[~same_place] = -1.0
-    hardest_pos, _ = pos_dists.max(dim=1)  # (B,)
-
-    # Hardest negative: min dist among different-place pairs
-    # Set same-place pairs to large value so they won't be selected as min
-    neg_dists = dist_mat.clone()
-    neg_dists[~diff_place] = 1e6
-    hardest_neg, _ = neg_dists.min(dim=1)  # (B,)
-
-    # Only compute loss for anchors that have at least one positive
-    valid = same_place.any(dim=1)
-    if valid.sum() == 0:
-        return torch.tensor(0.0, device=embeddings.device, requires_grad=True), 0.0, 0.0
-
-    hardest_pos = hardest_pos[valid]
-    hardest_neg = hardest_neg[valid]
-
-    loss = F.relu(hardest_pos - hardest_neg + margin).mean()
-
-    return loss, hardest_pos.mean().item(), hardest_neg.mean().item()
-
-
-def train_one_epoch_hard(
-    model: SiameseNetwork,
-    loader,
-    margin: float,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    scaler: torch.cuda.amp.GradScaler | None,
-    accumulate_grad_batches: int,
-) -> dict:
-    """Training loop with online batch-hard mining."""
-    model.train()
-    running_loss = 0.0
-    n_batches = 0
-
-    for i, (lidar, camera, labels) in enumerate(tqdm(loader, desc="  Train (hard)", leave=False)):
-        lidar = lidar.to(device)
-        camera = camera.to(device)
-        labels = labels.to(device)
-
-        with torch.autocast(device_type=device.type, enabled=scaler is not None):
-            # Forward all P*K frames through the shared encoder
-            embeddings = model.encoder(lidar, camera)  # (P*K, emb_dim)
-            loss, d_pos, d_neg = batch_hard_triplet_loss(embeddings, labels, margin)
-            loss = loss / accumulate_grad_batches
-
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            if (i + 1) % accumulate_grad_batches == 0 or (i + 1) == len(loader):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-        else:
-            loss.backward()
-            if (i + 1) % accumulate_grad_batches == 0 or (i + 1) == len(loader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-        running_loss += loss.item() * accumulate_grad_batches  # undo scaling for logging
-        n_batches += 1
-
-    avg_loss = running_loss / max(n_batches, 1)
-    return {"loss": avg_loss, "d_pos": d_pos, "d_neg": d_neg}
-
+    return {"loss": avg_loss, "d_pos": last_d_pos, "d_neg": last_d_neg}
 
 
 @torch.no_grad()
 def validate(
     model: SiameseNetwork,
     loader,
-    criterion: nn.TripletMarginLoss,
+    criterion_triplet: nn.TripletMarginLoss,
     device: torch.device,
 ) -> dict:
+    """Validate using triplet loss (consistent metric across loss types)."""
     model.eval()
     running_loss = 0.0
     total_d_pos = 0.0
@@ -216,7 +221,7 @@ def validate(
             desc_a, desc_p, desc_n = model(
                 (a_li, a_cam), (p_li, p_cam), (n_li, n_cam),
             )
-            loss = criterion(desc_a, desc_p, desc_n)
+            loss = criterion_triplet(desc_a, desc_p, desc_n)
         running_loss += loss.item()
 
         total_d_pos += (desc_a - desc_p).pow(2).sum(dim=1).sqrt().mean().item()
@@ -262,7 +267,10 @@ def load_checkpoint(
     if optimizer and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     if scheduler and "scheduler_state_dict" in ckpt:
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        try:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        except Exception:
+            pass  # Scheduler type may have changed
     return ckpt.get("epoch", 0), ckpt.get("best_val_loss", float("inf"))
 
 
@@ -273,39 +281,56 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
     print(f"Device: {device}")
 
     train_cfg = cfg["training"]
-    use_hard_mining = train_cfg.get("hard_mining", False)
+    loss_type = train_cfg.get("loss", "triplet")
 
     # ── Data ──────────────────────────────────────────────────────────────
-    triplet_train_loader, val_loader, _ = build_dataloaders(cfg)
-    hard_train_loader = None
-    if use_hard_mining:
-        hard_train_loader, _, _ = build_hard_dataloaders(cfg)
-    print(f"Train (triplet): {len(triplet_train_loader)} batches")
-    if hard_train_loader:
-        print(f"Train (hard):    {len(hard_train_loader)} batches")
+    train_loader, val_loader, _ = build_dataloaders(cfg)
+    print(f"Train: {len(train_loader)} batches")
     print(f"Val:   {len(val_loader.dataset)} triplets ({len(val_loader)} batches)")
 
     # ── Model ─────────────────────────────────────────────────────────────
-    emb_dim = cfg["model"]["embedding_dim"]
-    model = SiameseNetwork(embedding_dim=emb_dim, pretrained=True, modality_dropout_prob=train_cfg["modality_dropout_prob"]).to(device)
+    model_cfg = cfg["model"]
+    emb_dim = model_cfg["embedding_dim"]
+    backbone = model_cfg.get("backbone", "resnet50")
+    gem_p = model_cfg.get("gem_p", 3.0)
+
+    model = SiameseNetwork(
+        embedding_dim=emb_dim,
+        backbone=backbone,
+        pretrained=True,
+        gem_p=gem_p,
+        modality_dropout_prob=train_cfg["modality_dropout_prob"],
+    ).to(device)
 
     total, trainable = count_parameters(model)
-    print(f"Model: {trainable:,} trainable params ({total:,} total)")
+    print(f"Model: {backbone} + GeM, {trainable:,} trainable params ({total:,} total)")
 
-    # ── Loss / Optimizer / Scheduler ──────────────────────────────────────
-    criterion = nn.TripletMarginLoss(
-        margin=train_cfg["triplet_margin"], p=2,
-    )
-    optimizer = torch.optim.Adam(
+    # ── Loss ──────────────────────────────────────────────────────────────
+    if loss_type == "multi_similarity":
+        criterion = MultiSimilarityLoss(
+            alpha=train_cfg.get("ms_alpha", 2.0),
+            beta=train_cfg.get("ms_beta", 50.0),
+            base=train_cfg.get("ms_base", 0.5),
+        )
+        print(f"Loss: Multi-Similarity (α={criterion.alpha}, β={criterion.beta})")
+    else:
+        criterion = nn.TripletMarginLoss(margin=train_cfg["triplet_margin"], p=2)
+        print(f"Loss: Triplet Margin (margin={train_cfg['triplet_margin']})")
+
+    # Triplet loss for validation (consistent metric)
+    val_criterion = nn.TripletMarginLoss(margin=train_cfg.get("triplet_margin", 1.0), p=2)
+
+    # ── Optimizer / Scheduler ─────────────────────────────────────────────
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_cfg["learning_rate"],
         weight_decay=train_cfg["weight_decay"],
     )
-    scheduler = ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=3,
+
+    num_epochs = train_cfg["num_epochs"]
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=1e-6,
     )
-    warmup_epochs = 3
-    base_lr = train_cfg["learning_rate"]
 
     # ── Resume from checkpoint ────────────────────────────────────────────
     start_epoch = 0
@@ -319,119 +344,82 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
 
     # ── AMP & Accumulation ────────────────────────────────────────────────
     use_amp = train_cfg.get("amp", False)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if use_amp and device.type == "cuda" else None
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp and device.type == "cuda" else None
     acc_steps = train_cfg.get("accumulate_grad_batches", 1)
 
-    # ── Phase configuration ───────────────────────────────────────────────
+    # ── Training ──────────────────────────────────────────────────────────
     ckpt_dir = Path("checkpoints")
     patience = train_cfg["early_stopping_patience"]
-    num_epochs = train_cfg["num_epochs"]
-    hard_mining_epochs = train_cfg.get("hard_mining_epochs", 20)
+    epochs_no_improve = 0
 
-    # Phase 1: Triplet pre-training
-    # Phase 2: Hard mining fine-tuning (if enabled)
-    phases = [{"name": "Phase 1 (triplet)", "loader": triplet_train_loader, "hard": False, "epochs": num_epochs}]
-    if use_hard_mining and hard_train_loader:
-        phases.append({"name": "Phase 2 (hard mining)", "loader": hard_train_loader, "hard": True, "epochs": hard_mining_epochs})
+    print(f"\n{'='*60}")
+    print(f"Training for up to {num_epochs} epochs (patience={patience})")
+    print(f"  Backbone: {backbone} + GeM(p={gem_p})")
+    print(f"  Embedding dim: {emb_dim}")
+    print(f"  LR: {train_cfg['learning_rate']}, weight_decay: {train_cfg['weight_decay']}")
+    print(f"  Scheduler: CosineAnnealingWarmRestarts (T_0=10)")
+    print(f"  Modality dropout: {train_cfg['modality_dropout_prob']}")
+    print(f"  AMP Enabled: {bool(scaler)}")
+    print(f"  Accumulate Grad Batches: {acc_steps}")
+    print(f"{'='*60}\n")
 
     history = {"train_loss": [], "val_loss": [], "d_pos": [], "d_neg": []}
-    global_epoch = start_epoch
+    optimizer.zero_grad(set_to_none=True)
 
-    for phase in phases:
-        phase_name = phase["name"]
-        train_loader = phase["loader"]
-        is_hard = phase["hard"]
-        phase_epochs = phase["epochs"]
+    for epoch in range(start_epoch, num_epochs):
+        t0 = time.time()
 
-        # Reset early stopping and LR for phase 2
-        if is_hard:
+        # Train
+        train_metrics = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, scaler, acc_steps,
+            loss_type=loss_type,
+        )
+
+        # Validate (always use triplet loss for consistent comparison)
+        val_metrics = validate(model, val_loader, val_criterion, device)
+
+        # LR scheduler
+        scheduler.step(epoch + 1)
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        elapsed = time.time() - t0
+
+        # Log
+        print(
+            f"Epoch {epoch+1:>3}/{num_epochs} │ "
+            f"train_loss={train_metrics['loss']:.4f}  "
+            f"val_loss={val_metrics['loss']:.4f}  │ "
+            f"d_pos={val_metrics['d_pos']:.3f}  "
+            f"d_neg={val_metrics['d_neg']:.3f}  │ "
+            f"lr={current_lr:.1e}  │ "
+            f"{elapsed:.0f}s"
+        )
+
+        history["train_loss"].append(train_metrics["loss"])
+        history["val_loss"].append(val_metrics["loss"])
+        history["d_pos"].append(val_metrics["d_pos"])
+        history["d_neg"].append(val_metrics["d_neg"])
+
+        # Save last checkpoint
+        save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, best_val_loss)
+
+        # Save best checkpoint
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
             epochs_no_improve = 0
-            best_val_loss = float("inf")
-            # Reduce LR for fine-tuning
-            for pg in optimizer.param_groups:
-                pg["lr"] = train_cfg["learning_rate"] * 0.1
-            scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
-            print(f"\n{'─'*60}")
-            print(f"Switching to {phase_name} (lr={optimizer.param_groups[0]['lr']:.1e})")
-            print(f"{'─'*60}\n")
+            save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, epoch, best_val_loss)
+            print(f"  ✓ New best model saved (val_loss={best_val_loss:.4f})")
         else:
-            epochs_no_improve = 0
-
-        print(f"\n{'='*60}")
-        print(f"{phase_name}: up to {phase_epochs} epochs (patience={patience})")
-        print(f"  Triplet margin: {train_cfg['triplet_margin']}")
-        print(f"  LR: {optimizer.param_groups[0]['lr']:.1e}, weight_decay: {train_cfg['weight_decay']}")
-        print(f"  Modality dropout: {train_cfg['modality_dropout_prob']}")
-        print(f"  AMP Enabled: {bool(scaler)}")
-        print(f"  Accumulate Grad Batches: {acc_steps}")
-        print(f"{'='*60}\n")
-
-        optimizer.zero_grad(set_to_none=True)
-
-        for ep in range(phase_epochs):
-            t0 = time.time()
-
-            # Train
-            if is_hard:
-                train_metrics = train_one_epoch_hard(
-                    model, train_loader, train_cfg["triplet_margin"],
-                    optimizer, device, scaler, acc_steps
-                )
-            else:
-                train_metrics = train_one_epoch(
-                    model, train_loader, criterion, optimizer, device, scaler, acc_steps
-                )
-
-            # Validate
-            val_metrics = validate(model, val_loader, criterion, device)
-
-            # LR scheduler: warmup for first N epochs, then ReduceLROnPlateau
-            if global_epoch < warmup_epochs:
-                # Linear warmup: start at 0.1*base_lr, ramp to base_lr
-                warmup_factor = 0.1 + 0.9 * (global_epoch + 1) / warmup_epochs
-                for pg in optimizer.param_groups:
-                    pg["lr"] = base_lr * warmup_factor
-            else:
-                scheduler.step(val_metrics["loss"])
-            current_lr = optimizer.param_groups[0]["lr"]
-
-            elapsed = time.time() - t0
-
-            global_epoch += 1
-
-            # Log
-            print(
-                f"Epoch {ep+1:>3}/{phase_epochs} │ "
-                f"train_loss={train_metrics['loss']:.4f}  "
-                f"val_loss={val_metrics['loss']:.4f}  │ "
-                f"d_pos={val_metrics['d_pos']:.3f}  "
-                f"d_neg={val_metrics['d_neg']:.3f}  │ "
-                f"lr={current_lr:.1e}  │ "
-                f"{elapsed:.0f}s"
-            )
-
-            history["train_loss"].append(train_metrics["loss"])
-            history["val_loss"].append(val_metrics["loss"])
-            history["d_pos"].append(val_metrics["d_pos"])
-            history["d_neg"].append(val_metrics["d_neg"])
-
-            # Save last checkpoint
-            save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, global_epoch, best_val_loss)
-
-            # Save best checkpoint
-            if val_metrics["loss"] < best_val_loss:
-                best_val_loss = val_metrics["loss"]
-                epochs_no_improve = 0
-                save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, global_epoch, best_val_loss)
-                print(f"  ✓ New best model saved (val_loss={best_val_loss:.4f})")
-            else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= patience:
-                    print(f"\nEarly stopping: no improvement for {patience} epochs.")
-                    break
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"\nEarly stopping: no improvement for {patience} epochs.")
+                break
 
     # ── Save training curves ──────────────────────────────────────────────
-    save_training_curves(history, ckpt_dir / "training_curves.png")
+    try:
+        save_training_curves(history, ckpt_dir / "training_curves.png")
+    except Exception as e:
+        print(f"Warning: Could not save training curves: {e}")
     print(f"\nTraining complete. Best val_loss: {best_val_loss:.4f}")
     print(f"Best model: {ckpt_dir / 'best.pt'}")
 
@@ -447,16 +435,14 @@ def save_training_curves(history: dict, path: Path) -> None:
 
     epochs = range(1, len(history["train_loss"]) + 1)
 
-    # Loss curves
     axes[0].plot(epochs, history["train_loss"], "b-", label="Train Loss")
     axes[0].plot(epochs, history["val_loss"], "r-", label="Val Loss")
     axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Triplet Loss")
+    axes[0].set_ylabel("Loss")
     axes[0].set_title("Training & Validation Loss")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    # Distance curves
     axes[1].plot(epochs, history["d_pos"], "g-", label="d(Anchor, Positive)")
     axes[1].plot(epochs, history["d_neg"], "r-", label="d(Anchor, Negative)")
     axes[1].set_xlabel("Epoch")
