@@ -1,0 +1,17 @@
+# Don't send large data to Docker build context
+dataset/
+processed/
+checkpoints/
+.git/
+__pycache__/
+*.pyc
+*.pt
+*.pth
+*.npy
+*.csv
+venv/
+.venv/
+wandb/
+logs/
+presentation/
+.gemini/

@@ -1,0 +1,58 @@
+services:
+  train:
+    build: .
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      # Mount large data directories (not in git)
+      - ./dataset:/workspace/loop-closure-slam/dataset
+      - ./processed:/workspace/loop-closure-slam/processed
+      - ./checkpoints:/workspace/loop-closure-slam/checkpoints
+      # Mount source for live editing (optional)
+      - ./src:/workspace/loop-closure-slam/src
+      - ./configs:/workspace/loop-closure-slam/configs
+    shm_size: '8g'  # Shared memory for DataLoader workers
+    command: python3 -m src.step6_train --config configs/config.yaml
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Re-mine triplets
+  mine:
+    build: .
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./dataset:/workspace/loop-closure-slam/dataset
+      - ./processed:/workspace/loop-closure-slam/processed
+      - ./src:/workspace/loop-closure-slam/src
+      - ./configs:/workspace/loop-closure-slam/configs
+    command: python3 -m src.step3_mine_triplets --config configs/config.yaml
+
+  # Evaluate a trained model
+  evaluate:
+    build: .
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./dataset:/workspace/loop-closure-slam/dataset
+      - ./processed:/workspace/loop-closure-slam/processed
+      - ./checkpoints:/workspace/loop-closure-slam/checkpoints
+      - ./src:/workspace/loop-closure-slam/src
+      - ./configs:/workspace/loop-closure-slam/configs
+    command: python3 -m src.step7_evaluate --config configs/config.yaml --checkpoint checkpoints/best.pt
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -71,7 +71,8 @@ class MultiSimilarityLoss(nn.Module):
         pos_mask = same & ~eye
         neg_mask = ~same
 
-        loss = torch.tensor(0.0, device=embeddings.device)
+        # Differentiable zero (keeps gradient graph intact)
+        loss = embeddings.sum() * 0.0
         n_valid = 0
 
         for i in range(B):
