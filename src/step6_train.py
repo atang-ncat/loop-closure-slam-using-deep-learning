@@ -17,9 +17,16 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.profiler
 import yaml
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 from tqdm import tqdm
+
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
 
 from src.step4_dataset import build_dataloaders
 from src.step5_model import SiameseNetwork
@@ -123,6 +130,7 @@ def train_one_epoch(
     scaler,
     accumulate_grad_batches: int,
     loss_type: str = "triplet",
+    profiler=None,
 ) -> dict:
     model.train()
     running_loss = 0.0
@@ -194,6 +202,10 @@ def train_one_epoch(
 
         running_loss += loss.item() * accumulate_grad_batches
         n_batches += 1
+
+        # Step the profiler (if active)
+        if profiler is not None:
+            profiler.step()
 
     avg_loss = running_loss / max(n_batches, 1)
     return {"loss": avg_loss, "d_pos": last_d_pos, "d_neg": last_d_neg}
@@ -275,14 +287,56 @@ def load_checkpoint(
     return ckpt.get("epoch", 0), ckpt.get("best_val_loss", float("inf"))
 
 
+def transfer_backbone_from(path: Path, model: SiameseNetwork) -> int:
+    """
+    Transfer learning: load only backbone weights from an old checkpoint.
+
+    Useful when the fusion architecture has changed but we want to keep
+    the trained LiDAR/Camera backbone features.
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    old_state = ckpt["model_state_dict"]
+    new_state = model.state_dict()
+
+    loaded = 0
+    skipped = 0
+    for key, value in old_state.items():
+        if key in new_state and new_state[key].shape == value.shape:
+            new_state[key] = value
+            loaded += 1
+        else:
+            skipped += 1
+
+    model.load_state_dict(new_state)
+    epoch = ckpt.get("epoch", 0)
+    print(f"  Transfer: loaded {loaded} params, skipped {skipped} (shape mismatch or new)")
+    print(f"  Source checkpoint was from epoch {epoch}")
+    return epoch
+
+
 # ── Main training loop ────────────────────────────────────────────────────────
 
-def train(cfg: dict, resume_path: str | None = None) -> None:
+def train(cfg: dict, resume_path: str | None = None, transfer_path: str | None = None,
+         profile: bool = False) -> None:
     device = get_device()
     print(f"Device: {device}")
 
     train_cfg = cfg["training"]
     loss_type = train_cfg.get("loss", "triplet")
+
+    # ── Wandb ─────────────────────────────────────────────────────────────
+    use_wandb = HAS_WANDB and train_cfg.get("wandb", True)
+    if use_wandb:
+        wandb.init(
+            project="loop-closure-slam",
+            config=cfg,
+            name=f"{cfg['model'].get('backbone', 'resnet50')}_bs{train_cfg['batch_size']}_{loss_type}",
+            tags=["loop-closure", cfg["model"].get("backbone", "resnet50"), loss_type],
+            resume="allow",
+        )
+        print(f"Wandb: logging to run {wandb.run.name}")
+    else:
+        print("Wandb: disabled (set training.wandb: true or install wandb)")
 
     # ── Data ──────────────────────────────────────────────────────────────
     train_loader, val_loader, _ = build_dataloaders(cfg)
@@ -306,6 +360,9 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
     total, trainable = count_parameters(model)
     print(f"Model: {backbone} + GeM, {trainable:,} trainable params ({total:,} total)")
 
+    if use_wandb:
+        wandb.watch(model, log="gradients", log_freq=100)
+
     # ── Loss ──────────────────────────────────────────────────────────────
     if loss_type == "multi_similarity":
         criterion = MultiSimilarityLoss(
@@ -322,18 +379,45 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
     val_criterion = nn.TripletMarginLoss(margin=train_cfg.get("triplet_margin", 1.0), p=2)
 
     # ── Optimizer / Scheduler ─────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=train_cfg["learning_rate"],
-        weight_decay=train_cfg["weight_decay"],
-    )
+    backbone_lr = train_cfg.get("backbone_lr", train_cfg["learning_rate"])
+    fusion_lr = train_cfg.get("fusion_lr", train_cfg["learning_rate"])
+    warmup_epochs = train_cfg.get("warmup_epochs", 0)
+
+    # Differential learning rates: slow for pretrained backbones, fast for fusion
+    backbone_params = []
+    fusion_params = []
+    for name, param in model.named_parameters():
+        if "backbone" in name:
+            backbone_params.append(param)
+        else:
+            fusion_params.append(param)
+
+    optimizer = torch.optim.AdamW([
+        {"params": backbone_params, "lr": backbone_lr},
+        {"params": fusion_params, "lr": fusion_lr},
+    ], weight_decay=train_cfg["weight_decay"])
 
     num_epochs = train_cfg["num_epochs"]
-    scheduler = CosineAnnealingWarmRestarts(
+
+    # Cosine annealing (applied after warmup)
+    cosine_scheduler = CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-6,
     )
 
-    # ── Resume from checkpoint ────────────────────────────────────────────
+    # Linear warmup + cosine annealing
+    if warmup_epochs > 0:
+        warmup_scheduler = LinearLR(
+            optimizer, start_factor=0.01, total_iters=warmup_epochs,
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+    else:
+        scheduler = cosine_scheduler
+
+    # ── Resume or Transfer from checkpoint ─────────────────────────────────
     start_epoch = 0
     best_val_loss = float("inf")
     if resume_path and Path(resume_path).exists():
@@ -342,6 +426,10 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
         )
         start_epoch += 1
         print(f"Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+    elif transfer_path and Path(transfer_path).exists():
+        transfer_backbone_from(Path(transfer_path), model)
+        print(f"Transferred backbone weights from {transfer_path}")
+        print(f"  Starting fresh from epoch 0 (new fusion head)")
 
     # ── AMP & Accumulation ────────────────────────────────────────────────
     use_amp = train_cfg.get("amp", False)
@@ -357,8 +445,9 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
     print(f"Training for up to {num_epochs} epochs (patience={patience})")
     print(f"  Backbone: {backbone} + GeM(p={gem_p})")
     print(f"  Embedding dim: {emb_dim}")
-    print(f"  LR: {train_cfg['learning_rate']}, weight_decay: {train_cfg['weight_decay']}")
-    print(f"  Scheduler: CosineAnnealingWarmRestarts (T_0=10)")
+    print(f"  Backbone LR: {backbone_lr}, Fusion LR: {fusion_lr}")
+    print(f"  Weight decay: {train_cfg['weight_decay']}")
+    print(f"  Scheduler: LinearWarmup({warmup_epochs}ep) → CosineAnnealingWarmRestarts")
     print(f"  Modality dropout: {train_cfg['modality_dropout_prob']}")
     print(f"  AMP Enabled: {bool(scaler)}")
     print(f"  Accumulate Grad Batches: {acc_steps}")
@@ -367,6 +456,33 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
     history = {"train_loss": [], "val_loss": [], "d_pos": [], "d_neg": []}
     optimizer.zero_grad(set_to_none=True)
 
+    # ── PyTorch Profiler setup ────────────────────────────────────────
+    profile_epochs = 2  # profile only the first N epochs
+    profiler = None
+    if profile:
+        profiler_log_dir = Path("profiler_logs")
+        profiler_log_dir.mkdir(exist_ok=True)
+        total_profile_steps = len(train_loader) * profile_epochs
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=1, warmup=3, active=5, repeat=0,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                str(profiler_log_dir)
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        profiler.__enter__()
+        print(f"\n🔬 Profiler ENABLED — profiling first {profile_epochs} epochs")
+        print(f"   Output → {profiler_log_dir}/")
+        print(f"   View with: tensorboard --logdir={profiler_log_dir}\n")
+
     for epoch in range(start_epoch, num_epochs):
         t0 = time.time()
 
@@ -374,13 +490,20 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
         train_metrics = train_one_epoch(
             model, train_loader, criterion, optimizer, device, scaler, acc_steps,
             loss_type=loss_type,
+            profiler=profiler if (profile and epoch < start_epoch + profile_epochs) else None,
         )
+
+        # Stop profiler after profile_epochs
+        if profile and profiler is not None and epoch == start_epoch + profile_epochs - 1:
+            profiler.__exit__(None, None, None)
+            profiler = None
+            print(f"\n🔬 Profiler stopped after epoch {epoch+1}. Traces saved.\n")
 
         # Validate (always use triplet loss for consistent comparison)
         val_metrics = validate(model, val_loader, val_criterion, device)
 
         # LR scheduler
-        scheduler.step(epoch + 1)
+        scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
 
         elapsed = time.time() - t0
@@ -401,6 +524,22 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
         history["d_pos"].append(val_metrics["d_pos"])
         history["d_neg"].append(val_metrics["d_neg"])
 
+        # ── Wandb logging ─────────────────────────────────────────────
+        if use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_metrics["loss"],
+                "train/d_pos": train_metrics["d_pos"],
+                "train/d_neg": train_metrics["d_neg"],
+                "train/margin": train_metrics["d_neg"] - train_metrics["d_pos"],
+                "val/loss": val_metrics["loss"],
+                "val/d_pos": val_metrics["d_pos"],
+                "val/d_neg": val_metrics["d_neg"],
+                "val/margin": val_metrics["d_neg"] - val_metrics["d_pos"],
+                "lr": current_lr,
+                "epoch_time_s": elapsed,
+            })
+
         # Save last checkpoint
         save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, best_val_loss)
 
@@ -419,10 +558,17 @@ def train(cfg: dict, resume_path: str | None = None) -> None:
     # ── Save training curves ──────────────────────────────────────────────
     try:
         save_training_curves(history, ckpt_dir / "training_curves.png")
+        if use_wandb:
+            wandb.log({"training_curves": wandb.Image(str(ckpt_dir / "training_curves.png"))})
     except Exception as e:
         print(f"Warning: Could not save training curves: {e}")
     print(f"\nTraining complete. Best val_loss: {best_val_loss:.4f}")
     print(f"Best model: {ckpt_dir / 'best.pt'}")
+
+    if use_wandb:
+        wandb.summary["best_val_loss"] = best_val_loss
+        wandb.summary["total_epochs"] = len(history["train_loss"])
+        wandb.finish()
 
 
 # ── Training curves plot ──────────────────────────────────────────────────────
@@ -464,13 +610,15 @@ def save_training_curves(history: dict, path: Path) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Step 3: Train the Siamese Network")
     parser.add_argument("--config", default="configs/config.yaml")
-    parser.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--resume", default=None, help="Path to checkpoint to resume from (same architecture)")
+    parser.add_argument("--transfer", default=None, help="Path to checkpoint to transfer backbone weights from (different architecture OK)")
+    parser.add_argument("--profile", action="store_true", help="Enable PyTorch profiler for the first 2 training epochs")
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    train(cfg, resume_path=args.resume)
+    train(cfg, resume_path=args.resume, transfer_path=args.transfer, profile=args.profile)
 
 
 if __name__ == "__main__":

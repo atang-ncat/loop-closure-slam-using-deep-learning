@@ -4,11 +4,9 @@ Step 2B — Two-Stream Siamese CNN for Multi-Modal Loop Closure
 Architecture:
     LiDAR Range Image (1, 128, 1024) ──→ ResNet-50 + GeM ──→ 2048-d
                                                                   │
-                                                            Concatenate (4096-d)
+                                                          Gated Fusion
                                                                   │
     Camera RGB Image  (3, 224, 224)  ──→ ResNet-50 + GeM ──→ 2048-d
-                                                                  │
-                                                            Fusion MLP
                                                                   │
                                                             512-d L2-normalized
                                                            "Location Fingerprint"
@@ -115,6 +113,73 @@ class CameraBackbone(nn.Module):
         return out.flatten(1)
 
 
+# ── Gated Fusion ─────────────────────────────────────────────────────────────
+
+class GatedFusion(nn.Module):
+    """
+    Learnable gated fusion that weights LiDAR vs Camera features per-sample.
+
+    Instead of naive concatenation, learns a gate α ∈ [0, 1] per sample:
+        fused = α · lidar_proj + (1 - α) · camera_proj
+
+    This lets the network learn WHEN to trust each modality (e.g., trust
+    LiDAR more in texture-poor environments, camera more in geometrically
+    ambiguous scenes).
+    """
+
+    def __init__(self, feat_dim: int, embedding_dim: int, dropout: float = 0.4):
+        super().__init__()
+
+        # Project each modality to a common space
+        self.lidar_proj = nn.Sequential(
+            nn.Linear(feat_dim, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(inplace=True),
+        )
+        self.camera_proj = nn.Sequential(
+            nn.Linear(feat_dim, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(inplace=True),
+        )
+
+        # Gate network: takes concatenated features, outputs per-sample weight
+        self.gate = nn.Sequential(
+            nn.Linear(feat_dim * 2, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 1),
+            nn.Sigmoid(),
+        )
+
+        # Final projection with residual-style two-layer MLP
+        self.head = nn.Sequential(
+            nn.Linear(1024, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(1024, embedding_dim),
+        )
+
+    def forward(self, l_feat: torch.Tensor, c_feat: torch.Tensor) -> torch.Tensor:
+        """
+        l_feat: (B, feat_dim) from LiDAR backbone
+        c_feat: (B, feat_dim) from Camera backbone
+        Returns: (B, embedding_dim) L2-normalized descriptor
+        """
+        # Compute gate from raw features
+        alpha = self.gate(torch.cat([l_feat, c_feat], dim=1))  # (B, 1)
+
+        # Project each modality
+        l_proj = self.lidar_proj(l_feat)  # (B, 1024)
+        c_proj = self.camera_proj(c_feat)  # (B, 1024)
+
+        # Gated combination
+        fused = alpha * l_proj + (1 - alpha) * c_proj  # (B, 1024)
+
+        # Final projection
+        desc = self.head(fused)
+        return desc
+
+
 # ── Encoder ──────────────────────────────────────────────────────────────────
 
 class TwoStreamEncoder(nn.Module):
@@ -122,8 +187,8 @@ class TwoStreamEncoder(nn.Module):
     Fuses LiDAR geometry and camera texture into a single descriptor.
 
     Two parallel ResNet backbones with GeM pooling extract features.
-    A fusion MLP compresses the concatenated vector into
-    a compact, L2-normalized embedding.
+    A gated fusion module learns per-sample modality weighting,
+    producing a compact, L2-normalized embedding.
     """
 
     def __init__(
@@ -140,15 +205,8 @@ class TwoStreamEncoder(nn.Module):
         self.camera_backbone = CameraBackbone(backbone, pretrained, gem_p)
 
         feat_dim = self.lidar_backbone.feat_dim  # 2048 for resnet50, 512 for resnet18
-        fused_dim = feat_dim * 2  # 4096 for resnet50
 
-        self.fusion = nn.Sequential(
-            nn.Linear(fused_dim, 1024),
-            nn.BatchNorm1d(1024),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.3),
-            nn.Linear(1024, embedding_dim),
-        )
+        self.fusion = GatedFusion(feat_dim, embedding_dim, dropout=0.4)
 
     def forward(
         self, lidar: torch.Tensor, camera: torch.Tensor, mode: str = "fused"
@@ -172,8 +230,7 @@ class TwoStreamEncoder(nn.Module):
         elif mode == "camera_only":
             l_feat = torch.zeros_like(l_feat)
 
-        fused = torch.cat([l_feat, c_feat], dim=1)
-        desc = self.fusion(fused)
+        desc = self.fusion(l_feat, c_feat)
         return F.normalize(desc, p=2, dim=1)
 
 
@@ -238,6 +295,18 @@ if __name__ == "__main__":
     print(f"Model: SiameseNetwork (backbone={backbone}, embedding_dim={emb_dim}, GeM p={gem_p})")
     print(f"  Total parameters:     {total:,}")
     print(f"  Trainable parameters: {trainable:,}")
+
+    # Count per-group parameters
+    backbone_params = sum(
+        p.numel() for n, p in model.named_parameters()
+        if "backbone" in n
+    )
+    fusion_params = sum(
+        p.numel() for n, p in model.named_parameters()
+        if "fusion" in n
+    )
+    print(f"  Backbone parameters:  {backbone_params:,}")
+    print(f"  Fusion parameters:    {fusion_params:,}")
 
     B = 4
     dummy_lidar = torch.randn(B, 1, 128, 1024)

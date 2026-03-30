@@ -34,6 +34,7 @@ def get_camera_transform(train: bool, input_size: tuple[int, int] = (224, 224)):
             T.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
             T.RandomHorizontalFlip(p=0.5),
             T.ToTensor(),
+            T.RandomErasing(p=0.3, scale=(0.02, 0.15)),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
     else:
@@ -49,7 +50,7 @@ def augment_range_image(img: np.ndarray, train: bool) -> np.ndarray:
     """
     LiDAR range image augmentation.
     - Normalize to [0, 1] using the configured max_range
-    - During training: add Gaussian noise + random patch dropout
+    - During training: add Gaussian noise + random patch dropout + rotation
     """
     img = img.copy()
 
@@ -68,6 +69,13 @@ def augment_range_image(img: np.ndarray, train: bool) -> np.ndarray:
         # Random horizontal flip
         if np.random.random() < 0.5:
             img = np.flip(img, axis=1).copy()
+
+        # Random small rotation ±5° (simulates sensor mounting variation)
+        if np.random.random() < 0.5:
+            angle = np.random.uniform(-5.0, 5.0)
+            h, w = img.shape
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+            img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
 
     img = np.clip(img, 0.0, 1.0)
     return img
@@ -167,7 +175,7 @@ def build_dataloaders(cfg: dict) -> tuple[DataLoader, DataLoader, DataLoader]:
         train=False,
     )
 
-    num_workers = 4
+    num_workers = 8
 
     train_loader = DataLoader(
         train_ds,

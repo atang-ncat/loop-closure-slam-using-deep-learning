@@ -4,9 +4,9 @@
 
 # --- Paths ---
 paths:
-  dataset_root: "dataset"
+  dataset_root: "datasets"
   processed_root: "processed"
-  lidar_subdir: "lidar/pointclouds"
+  lidar_subdir: "lidar/pointclouds_with_ring"
   camera_subdir: "camera/images"
   odometry_csv: "odometry/novatel_odom.csv"
   gps_csv: "gps/inspva_precision.csv"
@@ -24,7 +24,7 @@ projection:
 # --- Step 1C: Triplet Mining ---
 mining:
   d_pos_m: 5.0                  # max distance (m) for "same place"
-  d_neg_m: 10.0                 # min distance (m) for "different place"
+  d_neg_m: 25.0                 # min distance (m) for "different place" (was 10m)
   d_time_s: 60.0                # min temporal gap (s) for positive pairs
 
 # --- Step 2B: Model ---
@@ -37,14 +37,17 @@ model:
 # --- Step 3: Training ---
 training:
   loss: multi_similarity         # triplet or multi_similarity
-  batch_size: 12                 # reduced for ResNet-50 memory
-  learning_rate: 1.0e-4
+  batch_size: 96                 # scaled up for 48GB RTX 6000 Ada
+  backbone_lr: 1.0e-5            # lower LR for pretrained backbones
+  fusion_lr: 1.0e-3              # higher LR for randomly-initialized fusion head
+  learning_rate: 1.0e-4          # fallback / legacy
   weight_decay: 1.0e-4           # stronger regularization for larger model
-  num_epochs: 50
+  num_epochs: 100                # extended training with improved pipeline
   triplet_margin: 1.0            # used for validation metric
-  early_stopping_patience: 15    # more patience with cosine annealing
-  modality_dropout_prob: 0.15
-  accumulate_grad_batches: 4     # effective batch = 48
+  early_stopping_patience: 20    # more patience with cosine annealing
+  modality_dropout_prob: 0.3     # stronger modality dropout for better fusion
+  warmup_epochs: 3               # linear warmup from 1e-6 to target LR
+  accumulate_grad_batches: 1     # real batch = 96, no accumulation needed
   amp: true
   # Multi-Similarity Loss params
   ms_alpha: 2.0
