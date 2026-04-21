@@ -232,7 +232,10 @@ def build_hard_dataloaders(cfg: dict):
     # PK sampler
     P = train_cfg.get("P", 8)
     K = train_cfg.get("K", 4)
-    pk_sampler = PKSampler(place_to_frames, P=P, K=K)
+    epochs_worth = train_cfg.get("epochs_worth", 1)
+    pk_sampler = PKSampler(
+        place_to_frames, P=P, K=K, epochs_worth=epochs_worth,
+    )
 
     train_loader = DataLoader(
         train_ds,

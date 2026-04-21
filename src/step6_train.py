@@ -14,6 +14,7 @@ import argparse
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,6 +30,7 @@ except ImportError:
     HAS_WANDB = False
 
 from src.step4_dataset import build_dataloaders
+from src.step4b_frame_dataset import build_hard_dataloaders
 from src.step5_model import SiameseNetwork
 
 
@@ -48,12 +50,27 @@ def count_parameters(model: nn.Module) -> tuple[int, int]:
 
 # ── Multi-Similarity Loss ────────────────────────────────────────────────────
 
+def _safe_logsumexp_with_one(scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Per-row: log(1 + sum_{k in mask} exp(scores[k])). Returns (B,).
+
+    Rows with empty mask return 0 (because log(1) = 0), contributing nothing
+    to the loss.  Implemented by prepending a zero-column and using the
+    numerically stable logsumexp.
+    """
+    scores = scores.masked_fill(~mask, float("-inf"))
+    zeros = torch.zeros(scores.size(0), 1, device=scores.device, dtype=scores.dtype)
+    scores_with_zero = torch.cat([zeros, scores], dim=1)
+    return torch.logsumexp(scores_with_zero, dim=1)
+
+
 class MultiSimilarityLoss(nn.Module):
     """
-    Multi-Similarity Loss (Wang et al., CVPR 2019).
+    Multi-Similarity Loss (Wang et al., CVPR 2019) — fully vectorized.
 
-    Considers ALL positive and negative pairs in a batch, weighting them
-    by their similarity. Much stronger gradient signal than triplet loss.
+    Supports arbitrary integer place labels (no assumption that each label
+    appears exactly twice, so this works with PK batches where each place
+    contributes K samples).
     """
 
     def __init__(self, alpha: float = 2.0, beta: float = 50.0, base: float = 0.5, margin: float = 0.1):
@@ -66,57 +83,39 @@ class MultiSimilarityLoss(nn.Module):
     def forward(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """
         embeddings: (B, D) L2-normalized
-        labels: (B,) integer place labels
+        labels: (B,) integer place labels (any integers; same int = same place)
         """
-        # Cosine similarity matrix (since embeddings are L2-normalized)
-        sim_mat = embeddings @ embeddings.T  # (B, B)
+        sim_mat = embeddings @ embeddings.T  # (B, B), cosine since L2-normed
 
         B = embeddings.size(0)
-        labels = labels.unsqueeze(0)
-        same = (labels == labels.T)
+        labels = labels.view(-1, 1)
+        same = labels == labels.T
         eye = torch.eye(B, dtype=torch.bool, device=embeddings.device)
         pos_mask = same & ~eye
         neg_mask = ~same
 
-        # Differentiable zero (keeps gradient graph intact)
-        loss = embeddings.sum() * 0.0
-        n_valid = 0
+        # Per-row easiest positive / hardest negative for hard-pair mining
+        pos_sim_for_min = sim_mat.masked_fill(~pos_mask, float("inf"))
+        pos_min, _ = pos_sim_for_min.min(dim=1, keepdim=True)  # (B, 1)
+        neg_sim_for_max = sim_mat.masked_fill(~neg_mask, float("-inf"))
+        neg_max, _ = neg_sim_for_max.max(dim=1, keepdim=True)  # (B, 1)
 
-        for i in range(B):
-            pos_idx = pos_mask[i].nonzero(as_tuple=True)[0]
-            neg_idx = neg_mask[i].nonzero(as_tuple=True)[0]
+        # Hard-pair masks per MS-loss definition
+        hard_pos_mask = pos_mask & (sim_mat - self.margin < neg_max)
+        hard_neg_mask = neg_mask & (sim_mat + self.margin > pos_min)
 
-            if len(pos_idx) == 0 or len(neg_idx) == 0:
-                continue
+        pos_arg = -self.alpha * (sim_mat - self.base)
+        neg_arg = self.beta * (sim_mat - self.base)
 
-            pos_sim = sim_mat[i, pos_idx]
-            neg_sim = sim_mat[i, neg_idx]
+        pos_term = _safe_logsumexp_with_one(pos_arg, hard_pos_mask) / self.alpha
+        neg_term = _safe_logsumexp_with_one(neg_arg, hard_neg_mask) / self.beta
 
-            # Mining: keep hard positives and hard negatives
-            neg_max = neg_sim.max()
-            pos_min = pos_sim.min()
+        # Count rows that actually have both a hard positive and a hard negative
+        valid = hard_pos_mask.any(dim=1) & hard_neg_mask.any(dim=1)
+        n_valid = valid.float().sum().clamp(min=1.0)
 
-            # Keep negatives harder than easiest positive
-            hard_neg = neg_sim[neg_sim + self.margin > pos_min]
-            # Keep positives harder than easiest negative
-            hard_pos = pos_sim[pos_sim - self.margin < neg_max]
-
-            if len(hard_neg) == 0 or len(hard_pos) == 0:
-                continue
-
-            # Positive term: pull together
-            pos_loss = (1.0 / self.alpha) * torch.log(
-                1 + torch.sum(torch.exp(-self.alpha * (hard_pos - self.base)))
-            )
-            # Negative term: push apart
-            neg_loss = (1.0 / self.beta) * torch.log(
-                1 + torch.sum(torch.exp(self.beta * (hard_neg - self.base)))
-            )
-
-            loss = loss + pos_loss + neg_loss
-            n_valid += 1
-
-        return loss / max(n_valid, 1)
+        loss = ((pos_term + neg_term) * valid.float()).sum() / n_valid
+        return loss
 
 
 # ── Training / Validation steps ───────────────────────────────────────────────
@@ -209,6 +208,156 @@ def train_one_epoch(
 
     avg_loss = running_loss / max(n_batches, 1)
     return {"loss": avg_loss, "d_pos": last_d_pos, "d_neg": last_d_neg}
+
+
+def train_one_epoch_pk(
+    model: SiameseNetwork,
+    loader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    scaler,
+    accumulate_grad_batches: int,
+) -> dict:
+    """
+    PK-batch training: each batch is (lidar, camera, labels) where `labels`
+    are real place IDs.  Works with MultiSimilarityLoss (label-aware).
+    """
+    model.train()
+    running_loss = 0.0
+    n_batches = 0
+    last_d_pos = 0.0
+    last_d_neg = 0.0
+
+    for i, (lidar, camera, labels) in enumerate(tqdm(loader, desc="  Train (PK)", leave=False)):
+        lidar = lidar.to(device, non_blocking=True)
+        camera = camera.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        with torch.autocast(device_type=device.type, enabled=scaler is not None):
+            embeddings = model.encoder(lidar, camera)
+            loss = criterion(embeddings, labels)
+            loss = loss / accumulate_grad_batches
+
+        # Monitoring: mean positive/negative cosine distance within batch
+        with torch.no_grad():
+            sim = embeddings @ embeddings.T
+            labs = labels.view(-1, 1)
+            same = (labs == labs.T) & ~torch.eye(
+                labels.size(0), dtype=torch.bool, device=device
+            )
+            diff = ~same & ~torch.eye(
+                labels.size(0), dtype=torch.bool, device=device
+            )
+            if same.any():
+                last_d_pos = (1.0 - sim[same]).mean().item()
+            if diff.any():
+                last_d_neg = (1.0 - sim[diff]).mean().item()
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            if (i + 1) % accumulate_grad_batches == 0 or (i + 1) == len(loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+        else:
+            loss.backward()
+            if (i + 1) % accumulate_grad_batches == 0 or (i + 1) == len(loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        running_loss += loss.item() * accumulate_grad_batches
+        n_batches += 1
+
+    avg_loss = running_loss / max(n_batches, 1)
+    return {"loss": avg_loss, "d_pos": last_d_pos, "d_neg": last_d_neg}
+
+
+@torch.no_grad()
+def validate_retrieval(
+    model: SiameseNetwork,
+    cfg: dict,
+    device: torch.device,
+    max_frames: int = 800,
+) -> dict:
+    """
+    Retrieval-based validation: extract descriptors over a subsample of val
+    frames and compute Recall@1 using GPS ground truth.  Much more meaningful
+    than triplet loss for monitoring place-recognition training.
+    """
+    import cv2
+    import pandas as pd
+    from src.step4_dataset import get_camera_transform
+
+    model.eval()
+    processed = Path(cfg["paths"]["processed_root"])
+    range_dir = processed / "range_images"
+    camera_dir = processed / "camera_synced"
+
+    cam_size = tuple(cfg["model"]["camera_input_size"])
+    max_range = cfg["projection"]["max_range"]
+    d_pos = cfg["mining"]["d_pos_m"]
+    d_time = cfg["mining"]["d_time_s"]
+
+    val_triplets = pd.read_csv(processed / "triplets_val.csv")
+    val_idx = np.unique(np.concatenate([
+        val_triplets["anchor_idx"].values,
+        val_triplets["positive_idx"].values,
+    ]))
+    val_idx.sort()
+    if len(val_idx) > max_frames:
+        step = len(val_idx) // max_frames
+        val_idx = val_idx[::step][:max_frames]
+
+    poses = np.load(processed / "frame_poses.npy")
+    eval_xy = poses[val_idx, :2]
+    eval_t = poses[val_idx, 3]
+
+    cam_transform = get_camera_transform(train=False, input_size=cam_size)
+    batch_size = 64
+    descs = []
+    for start in range(0, len(val_idx), batch_size):
+        batch_idx = val_idx[start : start + batch_size]
+        lidar_batch, cam_batch = [], []
+        for idx in batch_idx:
+            ri = np.load(range_dir / f"range_{idx:06d}.npy").astype(np.float32)
+            ri = np.clip(ri / max_range, 0.0, 1.0)
+            lidar_batch.append(torch.from_numpy(ri).unsqueeze(0))
+            cam = cv2.imread(str(camera_dir / f"cam_{idx:06d}.jpg"))
+            cam = cv2.cvtColor(cam, cv2.COLOR_BGR2RGB)
+            cam_batch.append(cam_transform(cam))
+        lidar_t = torch.stack(lidar_batch).to(device)
+        cam_t = torch.stack(cam_batch).to(device)
+        d = model.get_descriptor(lidar_t, cam_t, mode="fused")
+        descs.append(d.cpu().numpy())
+    descs = np.concatenate(descs, axis=0)
+
+    sim = descs @ descs.T
+    N = len(descs)
+
+    # Vectorized GT matrix: same-place AND temporally-far
+    dx = eval_xy[:, None, :] - eval_xy[None, :, :]
+    dist_sq = np.einsum("ijk,ijk->ij", dx, dx)
+    spatial_close = dist_sq < (d_pos * d_pos)
+    temporal_far = np.abs(eval_t[:, None] - eval_t[None, :]) > d_time
+    gt = spatial_close & temporal_far
+    np.fill_diagonal(gt, False)
+
+    # Recall@1 (mask self on the similarity matrix)
+    sim_masked = sim.copy()
+    np.fill_diagonal(sim_masked, -np.inf)
+    top1 = np.argmax(sim_masked, axis=1)
+    has_match = gt.any(axis=1)
+    total = int(has_match.sum())
+    hits = int(gt[np.arange(N), top1][has_match].sum())
+    return {
+        "recall_at_1": hits / max(total, 1),
+        "n_queries": total,
+        "n_frames": N,
+    }
 
 
 @torch.no_grad()
@@ -323,15 +472,20 @@ def train(cfg: dict, resume_path: str | None = None, transfer_path: str | None =
 
     train_cfg = cfg["training"]
     loss_type = train_cfg.get("loss", "triplet")
+    use_pk = bool(train_cfg.get("use_pk", False))
+    if use_pk and loss_type != "multi_similarity":
+        print("WARNING: use_pk=true requires multi_similarity loss. Forcing it.")
+        loss_type = "multi_similarity"
 
     # ── Wandb ─────────────────────────────────────────────────────────────
     use_wandb = HAS_WANDB and train_cfg.get("wandb", True)
     if use_wandb:
+        tag = "pk" if use_pk else "triplet"
         wandb.init(
             project="loop-closure-slam",
             config=cfg,
-            name=f"{cfg['model'].get('backbone', 'resnet50')}_bs{train_cfg['batch_size']}_{loss_type}",
-            tags=["loop-closure", cfg["model"].get("backbone", "resnet50"), loss_type],
+            name=f"{cfg['model'].get('backbone', 'resnet50')}_{tag}_{loss_type}",
+            tags=["loop-closure", cfg["model"].get("backbone", "resnet50"), loss_type, tag],
             resume="allow",
         )
         print(f"Wandb: logging to run {wandb.run.name}")
@@ -339,14 +493,21 @@ def train(cfg: dict, resume_path: str | None = None, transfer_path: str | None =
         print("Wandb: disabled (set training.wandb: true or install wandb)")
 
     # ── Data ──────────────────────────────────────────────────────────────
-    train_loader, val_loader, _ = build_dataloaders(cfg)
-    print(f"Train: {len(train_loader)} batches")
-    print(f"Val:   {len(val_loader.dataset)} triplets ({len(val_loader)} batches)")
+    if use_pk:
+        train_loader, val_loader, _ = build_hard_dataloaders(cfg)
+        P, K = train_cfg.get("P", 16), train_cfg.get("K", 6)
+        print(f"Train (PK): P={P}, K={K} → batch={P*K} × {len(train_loader)} batches/epoch")
+        print(f"Val: {len(val_loader.dataset)} triplets ({len(val_loader)} batches)")
+    else:
+        train_loader, val_loader, _ = build_dataloaders(cfg)
+        print(f"Train: {len(train_loader)} batches")
+        print(f"Val:   {len(val_loader.dataset)} triplets ({len(val_loader)} batches)")
 
     # ── Model ─────────────────────────────────────────────────────────────
     model_cfg = cfg["model"]
     emb_dim = model_cfg["embedding_dim"]
     backbone = model_cfg.get("backbone", "resnet50")
+    lidar_bb = model_cfg.get("lidar_backbone", "resnet50")
     gem_p = model_cfg.get("gem_p", 3.0)
 
     model = SiameseNetwork(
@@ -355,10 +516,11 @@ def train(cfg: dict, resume_path: str | None = None, transfer_path: str | None =
         pretrained=True,
         gem_p=gem_p,
         modality_dropout_prob=train_cfg["modality_dropout_prob"],
+        lidar_backbone=lidar_bb,
     ).to(device)
 
     total, trainable = count_parameters(model)
-    print(f"Model: {backbone} + GeM, {trainable:,} trainable params ({total:,} total)")
+    print(f"Model: LiDAR={lidar_bb}, Camera={backbone} + GeM, {trainable:,} trainable params ({total:,} total)")
 
     if use_wandb:
         wandb.watch(model, log="gradients", log_freq=100)
@@ -483,15 +645,24 @@ def train(cfg: dict, resume_path: str | None = None, transfer_path: str | None =
         print(f"   Output → {profiler_log_dir}/")
         print(f"   View with: tensorboard --logdir={profiler_log_dir}\n")
 
+    # Track best R@1 (primary metric in PK mode), val_loss as fallback
+    best_val_r1 = -1.0
+    val_retrieval_frames = train_cfg.get("val_retrieval_frames", 800)
+
     for epoch in range(start_epoch, num_epochs):
         t0 = time.time()
 
         # Train
-        train_metrics = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, scaler, acc_steps,
-            loss_type=loss_type,
-            profiler=profiler if (profile and epoch < start_epoch + profile_epochs) else None,
-        )
+        if use_pk:
+            train_metrics = train_one_epoch_pk(
+                model, train_loader, criterion, optimizer, device, scaler, acc_steps,
+            )
+        else:
+            train_metrics = train_one_epoch(
+                model, train_loader, criterion, optimizer, device, scaler, acc_steps,
+                loss_type=loss_type,
+                profiler=profiler if (profile and epoch < start_epoch + profile_epochs) else None,
+            )
 
         # Stop profiler after profile_epochs
         if profile and profiler is not None and epoch == start_epoch + profile_epochs - 1:
@@ -499,8 +670,15 @@ def train(cfg: dict, resume_path: str | None = None, transfer_path: str | None =
             profiler = None
             print(f"\n🔬 Profiler stopped after epoch {epoch+1}. Traces saved.\n")
 
-        # Validate (always use triplet loss for consistent comparison)
-        val_metrics = validate(model, val_loader, val_criterion, device)
+        # Validate — in PK mode, retrieval R@1 is the primary signal.
+        # Skip the slow triplet-loss pass to keep epochs fast.
+        if use_pk:
+            val_metrics = {"loss": 0.0, "d_pos": 0.0, "d_neg": 0.0}
+        else:
+            val_metrics = validate(model, val_loader, val_criterion, device)
+        retrieval_metrics = validate_retrieval(
+            model, cfg, device, max_frames=val_retrieval_frames,
+        )
 
         # LR scheduler
         scheduler.step()
@@ -508,13 +686,16 @@ def train(cfg: dict, resume_path: str | None = None, transfer_path: str | None =
 
         elapsed = time.time() - t0
 
-        # Log
+        # Log — in PK mode, prefer train-side d_pos/d_neg since val is retrieval-only
+        d_pos_disp = train_metrics["d_pos"] if use_pk else val_metrics["d_pos"]
+        d_neg_disp = train_metrics["d_neg"] if use_pk else val_metrics["d_neg"]
         print(
             f"Epoch {epoch+1:>3}/{num_epochs} │ "
             f"train_loss={train_metrics['loss']:.4f}  "
-            f"val_loss={val_metrics['loss']:.4f}  │ "
-            f"d_pos={val_metrics['d_pos']:.3f}  "
-            f"d_neg={val_metrics['d_neg']:.3f}  │ "
+            + ("" if use_pk else f"val_loss={val_metrics['loss']:.4f}  ")
+            + f"│ val_R@1={retrieval_metrics['recall_at_1']:.3f} "
+            f"(n={retrieval_metrics['n_queries']})  │ "
+            f"d_pos={d_pos_disp:.3f} d_neg={d_neg_disp:.3f}  │ "
             f"lr={current_lr:.1e}  │ "
             f"{elapsed:.0f}s"
         )
@@ -524,7 +705,6 @@ def train(cfg: dict, resume_path: str | None = None, transfer_path: str | None =
         history["d_pos"].append(val_metrics["d_pos"])
         history["d_neg"].append(val_metrics["d_neg"])
 
-        # ── Wandb logging ─────────────────────────────────────────────
         if use_wandb:
             wandb.log({
                 "epoch": epoch + 1,
@@ -536,19 +716,31 @@ def train(cfg: dict, resume_path: str | None = None, transfer_path: str | None =
                 "val/d_pos": val_metrics["d_pos"],
                 "val/d_neg": val_metrics["d_neg"],
                 "val/margin": val_metrics["d_neg"] - val_metrics["d_pos"],
+                "val/recall_at_1": retrieval_metrics["recall_at_1"],
+                "val/n_queries": retrieval_metrics["n_queries"],
                 "lr": current_lr,
                 "epoch_time_s": elapsed,
             })
 
-        # Save last checkpoint
+        # Save last checkpoint every epoch
         save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler, epoch, best_val_loss)
 
-        # Save best checkpoint
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
+        # Primary early-stopping signal: retrieval R@1 on val (PK mode) or val loss (legacy)
+        primary_improved = (
+            retrieval_metrics["recall_at_1"] > best_val_r1
+            if use_pk else
+            val_metrics["loss"] < best_val_loss
+        )
+
+        if primary_improved:
+            best_val_r1 = max(best_val_r1, retrieval_metrics["recall_at_1"])
+            best_val_loss = min(best_val_loss, val_metrics["loss"])
             epochs_no_improve = 0
             save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler, epoch, best_val_loss)
-            print(f"  ✓ New best model saved (val_loss={best_val_loss:.4f})")
+            if use_pk:
+                print(f"  ✓ New best model saved (val_R@1={best_val_r1:.4f})")
+            else:
+                print(f"  ✓ New best model saved (val_loss={best_val_loss:.4f})")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
@@ -567,6 +759,7 @@ def train(cfg: dict, resume_path: str | None = None, transfer_path: str | None =
 
     if use_wandb:
         wandb.summary["best_val_loss"] = best_val_loss
+        wandb.summary["best_val_recall_at_1"] = best_val_r1
         wandb.summary["total_epochs"] = len(history["train_loss"])
         wandb.finish()
 

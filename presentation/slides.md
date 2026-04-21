@@ -202,7 +202,7 @@ Minimizes distance between same-place pairs while maximizing distance between di
 
 **Key takeaway**: Fused model outperforms both single-modality baselines on AUC-PR and F1, confirming that **sensor fusion adds value**. Recall@1 of 40.6% means the correct loop closure is the top retrieval 4 out of 10 times — far above random chance (0.26% positive rate).
 
-> *Figure: Show `processed/pr_curves.png` — three-curve comparison plot*
+> *Figure: Legacy PR curve from this run — `figures/legacy/pr_curves_v0_baseline_raw.png`. See also `figures/pr_curves_main.png` and `figures/ablation_bars.png` for current results with re-ranking.*
 
 ---
 

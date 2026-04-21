@@ -30,29 +30,49 @@ mining:
 # --- Step 2B: Model ---
 model:
   embedding_dim: 512
-  backbone: resnet50             # resnet18 or resnet50
+  backbone: resnet50             # resnet18 or resnet50 (camera backbone)
+  lidar_backbone: overlap_transformer  # overlap_transformer or resnet50
   gem_p: 3.0                     # GeM pooling initial power
   camera_input_size: [224, 224]  # resize camera images to this
 
 # --- Step 3: Training ---
 training:
   loss: multi_similarity         # triplet or multi_similarity
-  batch_size: 96                 # scaled up for 48GB RTX 6000 Ada
+  use_pk: true                   # NEW: PK sampler + per-place labels (fixes MS-loss label bug)
+  P: 16                          # PK sampler: places per batch
+  K: 6                           # PK sampler: samples per place (batch = P*K = 96)
+  epochs_worth: 12               # batches per epoch = (n_places // P) * epochs_worth (~276 batches)
+  batch_size: 96                 # used for val/test loaders and legacy triplet mode
   backbone_lr: 1.0e-5            # lower LR for pretrained backbones
   fusion_lr: 1.0e-3              # higher LR for randomly-initialized fusion head
   learning_rate: 1.0e-4          # fallback / legacy
   weight_decay: 1.0e-4           # stronger regularization for larger model
-  num_epochs: 100                # extended training with improved pipeline
+  num_epochs: 40                 # PK converges much faster than triplet — room to spare
   triplet_margin: 1.0            # used for validation metric
-  early_stopping_patience: 20    # more patience with cosine annealing
+  early_stopping_patience: 15    # tightened for faster turnaround
   modality_dropout_prob: 0.3     # stronger modality dropout for better fusion
   warmup_epochs: 3               # linear warmup from 1e-6 to target LR
   accumulate_grad_batches: 1     # real batch = 96, no accumulation needed
   amp: true
+  val_retrieval_frames: 800      # subsample val frames used for R@1 early-stopping
   # Multi-Similarity Loss params
   ms_alpha: 2.0
   ms_beta: 50.0
   ms_base: 0.5
+
+# --- Step 4: Evaluation ---
+eval:
+  max_eval_frames: 2000          # cap on frames for N×N similarity matrix
+  whiten: false                  # PCA whitening — disabled: hurt baseline (−3.4 AUC-PR)
+  whiten_dim: 256                # (only used if whiten=true)
+  tta: true                      # flip-TTA: +1.5 R@1 on baseline, nearly free
+  seq_len: 1                     # sequence-averaging window (1 = single frame)
+  ranks: [1, 5, 10]              # Recall@K values to report
+  # --- Re-ranking (HUGE win — zero retraining cost) ---
+  alpha_qe_k: 5                  # α-QE top-k neighbors for query expansion (0 = disabled)
+  alpha_qe_pow: 3.0              # α-QE exponent on neighbor similarities
+  dual_softmax: true             # Dual-softmax rerank: +0.148 R@1 when combined with α-QE
+  dual_softmax_temp: 1.00        # Tuned: best across all metrics (R@1 saturates, AUC-PR peaks)
 
 # --- Train / Val / Test split (by time) ---
 split:

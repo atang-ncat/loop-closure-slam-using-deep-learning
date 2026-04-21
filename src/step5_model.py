@@ -2,11 +2,11 @@
 Step 2B — Two-Stream Siamese CNN for Multi-Modal Loop Closure
 ==============================================================
 Architecture:
-    LiDAR Range Image (1, 128, 1024) ──→ ResNet-50 + GeM ──→ 2048-d
+    LiDAR Range Image (1, 128, 1024) ──→ OverlapTransformer ─→ 256-d
                                                                   │
                                                           Gated Fusion
                                                                   │
-    Camera RGB Image  (3, 224, 224)  ──→ ResNet-50 + GeM ──→ 2048-d
+    Camera RGB Image  (3, 224, 224)  ──→ ResNet-50 + GeM ─→ 2048-d
                                                                   │
                                                             512-d L2-normalized
                                                            "Location Fingerprint"
@@ -20,6 +20,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 import yaml
+
+from src.overlap_transformer import OverlapTransformerBackbone
 
 
 # ── GeM Pooling ──────────────────────────────────────────────────────────────
@@ -119,32 +121,31 @@ class GatedFusion(nn.Module):
     """
     Learnable gated fusion that weights LiDAR vs Camera features per-sample.
 
-    Instead of naive concatenation, learns a gate α ∈ [0, 1] per sample:
-        fused = α · lidar_proj + (1 - α) · camera_proj
+    Supports asymmetric feature dimensions (e.g., 256-d LiDAR + 2048-d Camera).
+    Projects each modality to a common 1024-d space before gating.
 
-    This lets the network learn WHEN to trust each modality (e.g., trust
-    LiDAR more in texture-poor environments, camera more in geometrically
-    ambiguous scenes).
+    Gate α ∈ [0, 1] per sample:
+        fused = α · lidar_proj + (1 - α) · camera_proj
     """
 
-    def __init__(self, feat_dim: int, embedding_dim: int, dropout: float = 0.4):
+    def __init__(self, lidar_dim: int, camera_dim: int, embedding_dim: int, dropout: float = 0.4):
         super().__init__()
 
         # Project each modality to a common space
         self.lidar_proj = nn.Sequential(
-            nn.Linear(feat_dim, 1024),
+            nn.Linear(lidar_dim, 1024),
             nn.BatchNorm1d(1024),
             nn.ReLU(inplace=True),
         )
         self.camera_proj = nn.Sequential(
-            nn.Linear(feat_dim, 1024),
+            nn.Linear(camera_dim, 1024),
             nn.BatchNorm1d(1024),
             nn.ReLU(inplace=True),
         )
 
         # Gate network: takes concatenated features, outputs per-sample weight
         self.gate = nn.Sequential(
-            nn.Linear(feat_dim * 2, 512),
+            nn.Linear(lidar_dim + camera_dim, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, 1),
             nn.Sigmoid(),
@@ -161,8 +162,8 @@ class GatedFusion(nn.Module):
 
     def forward(self, l_feat: torch.Tensor, c_feat: torch.Tensor) -> torch.Tensor:
         """
-        l_feat: (B, feat_dim) from LiDAR backbone
-        c_feat: (B, feat_dim) from Camera backbone
+        l_feat: (B, lidar_dim) from LiDAR backbone
+        c_feat: (B, camera_dim) from Camera backbone
         Returns: (B, embedding_dim) L2-normalized descriptor
         """
         # Compute gate from raw features
@@ -186,9 +187,9 @@ class TwoStreamEncoder(nn.Module):
     """
     Fuses LiDAR geometry and camera texture into a single descriptor.
 
-    Two parallel ResNet backbones with GeM pooling extract features.
-    A gated fusion module learns per-sample modality weighting,
-    producing a compact, L2-normalized embedding.
+    LiDAR:  OverlapTransformer → 256-d  (or ResNet-50 + GeM → 2048-d)
+    Camera: ResNet-50 + GeM → 2048-d
+    Fusion: Gated fusion → 512-d L2-normalized
     """
 
     def __init__(
@@ -198,15 +199,25 @@ class TwoStreamEncoder(nn.Module):
         pretrained: bool = True,
         gem_p: float = 3.0,
         modality_dropout_prob: float = 0.0,
+        lidar_backbone: str = "resnet50",
     ):
         super().__init__()
         self.modality_dropout_prob = modality_dropout_prob
-        self.lidar_backbone = LiDARBackbone(backbone, pretrained, gem_p)
+
+        # LiDAR backbone: OverlapTransformer or ResNet
+        if lidar_backbone == "overlap_transformer":
+            self.lidar_backbone = OverlapTransformerBackbone(
+                height=128, width=1024, channels=1, output_dim=256,
+            )
+        else:
+            self.lidar_backbone = LiDARBackbone(backbone, pretrained, gem_p)
+
         self.camera_backbone = CameraBackbone(backbone, pretrained, gem_p)
 
-        feat_dim = self.lidar_backbone.feat_dim  # 2048 for resnet50, 512 for resnet18
+        lidar_dim = self.lidar_backbone.feat_dim
+        camera_dim = self.camera_backbone.feat_dim
 
-        self.fusion = GatedFusion(feat_dim, embedding_dim, dropout=0.4)
+        self.fusion = GatedFusion(lidar_dim, camera_dim, embedding_dim, dropout=0.4)
 
     def forward(
         self, lidar: torch.Tensor, camera: torch.Tensor, mode: str = "fused"
@@ -248,10 +259,12 @@ class SiameseNetwork(nn.Module):
         pretrained: bool = True,
         gem_p: float = 3.0,
         modality_dropout_prob: float = 0.0,
+        lidar_backbone: str = "resnet50",
     ):
         super().__init__()
         self.encoder = TwoStreamEncoder(
-            embedding_dim, backbone, pretrained, gem_p, modality_dropout_prob
+            embedding_dim, backbone, pretrained, gem_p,
+            modality_dropout_prob, lidar_backbone,
         )
 
     def forward(
@@ -283,29 +296,36 @@ if __name__ == "__main__":
 
     emb_dim = cfg["model"]["embedding_dim"]
     backbone = cfg["model"].get("backbone", "resnet50")
+    lidar_bb = cfg["model"].get("lidar_backbone", "resnet50")
     gem_p = cfg["model"].get("gem_p", 3.0)
     modality_dropout_prob = cfg["training"]["modality_dropout_prob"]
     model = SiameseNetwork(
         embedding_dim=emb_dim, backbone=backbone, pretrained=True,
         gem_p=gem_p, modality_dropout_prob=modality_dropout_prob,
+        lidar_backbone=lidar_bb,
     )
 
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: SiameseNetwork (backbone={backbone}, embedding_dim={emb_dim}, GeM p={gem_p})")
+    print(f"Model: SiameseNetwork (lidar={lidar_bb}, camera={backbone}, emb={emb_dim})")
     print(f"  Total parameters:     {total:,}")
     print(f"  Trainable parameters: {trainable:,}")
 
     # Count per-group parameters
-    backbone_params = sum(
+    lidar_params = sum(
         p.numel() for n, p in model.named_parameters()
-        if "backbone" in n
+        if "lidar_backbone" in n
+    )
+    camera_params = sum(
+        p.numel() for n, p in model.named_parameters()
+        if "camera_backbone" in n
     )
     fusion_params = sum(
         p.numel() for n, p in model.named_parameters()
         if "fusion" in n
     )
-    print(f"  Backbone parameters:  {backbone_params:,}")
+    print(f"  LiDAR backbone:       {lidar_params:,}")
+    print(f"  Camera backbone:      {camera_params:,}")
     print(f"  Fusion parameters:    {fusion_params:,}")
 
     B = 4

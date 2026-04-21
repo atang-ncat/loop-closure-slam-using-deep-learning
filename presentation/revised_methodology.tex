@@ -132,7 +132,7 @@ This phase fine-tunes at $0.1\times$ the Phase~1 learning rate for up to 20 epoc
 
 \begin{figure}[t]
     \centering
-    \includegraphics[width=\linewidth]{figures/training_curves.png}
+    \includegraphics[width=\linewidth]{figures/legacy/training_curves_v0_baseline.png}
     \caption{Two-phase training dynamics. Phase~1 (epochs 1--14) uses pre-mined triplets; loss converges near zero as random negatives become trivial. Phase~2 (epochs 15--25) switches to online batch-hard mining; training loss spikes to ${\sim}0.7$ as the model confronts genuinely confusable frame pairs, then gradually decreases. Embedding distances (right) show the positive distance $d(A,P)$ decreasing and the negative distance $d(A,N)$ remaining well-separated throughout.}
     \label{fig:training_curves}
 \end{figure}
@@ -171,7 +171,7 @@ Best Thresh. & 0.9932 & 0.9850 & 0.9910 \\
 
 \begin{figure}[t]
     \centering
-    \includegraphics[width=0.85\linewidth]{figures/pr_curves.png}
+    \includegraphics[width=0.85\linewidth]{figures/legacy/pr_curves_v0_baseline_raw.png}
     \caption{Precision-Recall curves for loop closure detection. The fused model (blue) achieves the highest AUC-PR (0.1562), outperforming LiDAR-only (green, 0.1398) and camera-only (red, 0.1165) baselines, demonstrating the benefit of multi-modal fusion.}
     \label{fig:pr_curves}
 \end{figure}
